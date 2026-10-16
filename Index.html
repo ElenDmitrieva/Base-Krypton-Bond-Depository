@@ -1,0 +1,196 @@
+// SPDX-License-Identifier: MIT
+pragma solidity 0.8.37;
+
+contract KryptonBondDepository {
+    enum BondStatus { Active, Redeemed, Defaulted }
+
+    struct BondSeries {
+        uint256 faceValue;
+        uint256 issuePrice;
+        uint256 couponRateBps; // 300 = 3%
+        uint256 maturityTimestamp;
+        bool isOpen;
+    }
+
+    struct BondCertificate {
+        uint256 seriesId;
+        address holder;
+        uint256 purchaseTime;
+        uint256 lastCouponClaim;
+        BondStatus status;
+    }
+
+    address payable public immutable depositoryGovernor;
+    string public depositoryName;
+    uint256 public seriesCounter;
+    uint256 public certificateCounter;
+    uint256 public totalObligationsCapital;
+
+    mapping(uint256 => BondSeries) public bondSeries;
+    mapping(uint256 => BondCertificate) public certificates;
+
+    event SeriesCreated(uint256 indexed seriesId, uint256 faceValue, uint256 issuePrice, uint256 maturity);
+    event BondPurchased(uint256 indexed certificateId, uint256 indexed seriesId, address indexed buyer);
+    event CouponClaimed(uint256 indexed certificateId, address indexed holder, uint256 couponAmount);
+    event BondRedeemed(uint256 indexed certificateId, address indexed holder, uint256 principalPaid);
+    event CertificateTransferred(uint256 indexed certificateId, address indexed from, address indexed to);
+    event ReserveFunded(address indexed funder, uint256 amount);
+    event SeriesStatusToggled(uint256 indexed seriesId, bool isOpen);
+    event DepositoryNameUpdated(string newName);
+    event ReserveSurplusWithdrawn(address indexed governor, uint256 amount);
+
+    modifier onlyGovernor() {
+        require(msg.sender == depositoryGovernor, "KryptonBond: Access denied");
+        _;
+    }
+
+    constructor() {
+        depositoryGovernor = payable(msg.sender);
+        depositoryName = "Krypton Base Institutional Debt Core v1";
+    }
+
+    // 1. Пополнение резервного фонда погашения
+    function topUpRedemptionReserve() external payable onlyGovernor {
+        require(msg.value > 0, "KryptonBond: Zero deposit rejected");
+        emit ReserveFunded(msg.sender, msg.value);
+    }
+
+    // 2. Создание новой серии выпуска облигаций
+    function issueBondOffering(
+        uint256 faceValue,
+        uint256 issuePrice,
+        uint256 couponRateBps,
+        uint256 termSeconds
+    ) external onlyGovernor returns (uint256) {
+        require(faceValue > issuePrice, "KryptonBond: Face value must exceed issue price");
+        require(issuePrice > 0, "KryptonBond: Issue price must be positive");
+        require(termSeconds >= 60, "KryptonBond: Minimum term 60 seconds");
+
+        seriesCounter++;
+        bondSeries[seriesCounter] = BondSeries({
+            faceValue: faceValue,
+            issuePrice: issuePrice,
+            couponRateBps: couponRateBps,
+            maturityTimestamp: block.timestamp + termSeconds,
+            isOpen: true
+        });
+
+        emit SeriesCreated(seriesCounter, faceValue, issuePrice, block.timestamp + termSeconds);
+        return seriesCounter;
+    }
+
+    // 3. Покупка облигации за ETH
+    function purchaseBond(uint256 seriesId) external payable returns (uint256) {
+        BondSeries storage s = bondSeries[seriesId];
+        require(seriesId > 0 && seriesId <= seriesCounter, "KryptonBond: Non-existent series");
+        require(s.isOpen, "KryptonBond: Series closed");
+        require(block.timestamp < s.maturityTimestamp, "KryptonBond: Series already matured");
+        require(msg.value == s.issuePrice, "KryptonBond: Exact issue price required");
+
+        certificateCounter++;
+        certificates[certificateCounter] = BondCertificate({
+            seriesId: seriesId,
+            holder: msg.sender,
+            purchaseTime: block.timestamp,
+            lastCouponClaim: block.timestamp,
+            status: BondStatus.Active
+        });
+
+        totalObligationsCapital += s.faceValue;
+        emit BondPurchased(certificateCounter, seriesId, msg.sender);
+        return certificateCounter;
+    }
+
+    // 4. Клейм периодического купонного дохода
+    function claimCouponPayout(uint256 certificateId) external {
+        BondCertificate storage cert = certificates[certificateId];
+        require(cert.status == BondStatus.Active, "KryptonBond: Certificate not active");
+        require(cert.holder == msg.sender, "KryptonBond: Not certificate holder");
+
+        BondSeries memory s = bondSeries[cert.seriesId];
+        uint256 elapsed = block.timestamp - cert.lastCouponClaim;
+        require(elapsed > 0, "KryptonBond: Zero elapsed time");
+
+        uint256 coupon = (s.faceValue * s.couponRateBps * elapsed) / (365 days * 10000);
+        require(coupon > 0, "KryptonBond: No accrued coupon");
+        require(address(this).balance >= coupon, "KryptonBond: Insufficient liquidity for coupon");
+
+        cert.lastCouponClaim = block.timestamp;
+        (bool sent, ) = payable(msg.sender).call{value: coupon}("");
+        require(sent, "KryptonBond: Coupon payout failed");
+
+        emit CouponClaimed(certificateId, msg.sender, coupon);
+    }
+
+    // 5. Погашение номинала облигации (Redemption)
+    function redeemMaturedBond(uint256 certificateId) external {
+        BondCertificate storage cert = certificates[certificateId];
+        require(cert.status == BondStatus.Active, "KryptonBond: Not active");
+        require(cert.holder == msg.sender, "KryptonBond: Not holder");
+
+        BondSeries memory s = bondSeries[cert.seriesId];
+        require(block.timestamp >= s.maturityTimestamp, "KryptonBond: Not matured yet");
+        require(address(this).balance >= s.faceValue, "KryptonBond: Insufficient pool balance");
+
+        cert.status = BondStatus.Redeemed;
+        totalObligationsCapital -= s.faceValue;
+
+        (bool sent, ) = payable(msg.sender).call{value: s.faceValue}("");
+        require(sent, "KryptonBond: Principal payout failed");
+
+        emit BondRedeemed(certificateId, msg.sender, s.faceValue);
+    }
+
+    // 6. Передача сертификата облигации другому адресу
+    function transferBondCertificate(uint256 certificateId, address newHolder) external {
+        BondCertificate storage cert = certificates[certificateId];
+        require(cert.status == BondStatus.Active, "KryptonBond: Not active");
+        require(cert.holder == msg.sender, "KryptonBond: Unauthorized");
+        require(newHolder != address(0), "KryptonBond: Invalid recipient");
+
+        address prev = cert.holder;
+        cert.holder = newHolder;
+        emit CertificateTransferred(certificateId, prev, newHolder);
+    }
+
+    // 7. Переключение доступности серии выпуска
+    function toggleSeriesStatus(uint256 seriesId, bool isOpen) external onlyGovernor {
+        require(seriesId > 0 && seriesId <= seriesCounter, "KryptonBond: Invalid series");
+        bondSeries[seriesId].isOpen = isOpen;
+        emit SeriesStatusToggled(seriesId, isOpen);
+    }
+
+    // 8. Обновление мета-дескриптора депозитария
+    function updateDepositoryName(string calldata newName) external onlyGovernor {
+        require(bytes(newName).length > 0, "KryptonBond: Empty name");
+        depositoryName = newName;
+        emit DepositoryNameUpdated(newName);
+    }
+
+    // 9. Вывод излишков резерва казначейства
+    function emergencyReserveDrain() external onlyGovernor {
+        uint256 surplus = address(this).balance > totalObligationsCapital ? address(this).balance - totalObligationsCapital : 0;
+        if (surplus == 0 && address(this).balance > 0 && totalObligationsCapital == 0) {
+            surplus = address(this).balance;
+        }
+        require(surplus > 0, "KryptonBond: No surplus available");
+
+        (bool sent, ) = depositoryGovernor.call{value: surplus}("");
+        require(sent, "KryptonBond: Sweep failed");
+
+        emit ReserveSurplusWithdrawn(depositoryGovernor, surplus);
+    }
+
+    // Просмотр сертификата
+    function getCertificateInfo(uint256 certificateId) external view returns (
+        uint256 seriesId,
+        address holder,
+        uint256 purchaseTime,
+        BondStatus status,
+        bool isMatured
+    ) {
+        BondCertificate memory c = certificates[certificateId];
+        bool matured = block.timestamp >= bondSeries[c.seriesId].maturityTimestamp;
+        return (c.seriesId, c.holder, c.purchaseTime, c.status, matured);
+    }
+}
